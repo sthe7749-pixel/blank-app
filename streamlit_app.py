@@ -1,25 +1,26 @@
 # ─────────────────────────────────────────────────────────
-# SOL Live — Kraken
-# Plotly 캔들(자동 확대) + MA/RSI/MACD/ATR
-# 타이밍 제안(BUY/SELL) + 손익 시뮬레이션 + 신호 로그 + 텔레그램 알림(선택)
+# SOL Live — Kraken (+ Binance WebSocket Live)
+# Plotly 캔들(자동 확대) · MA/RSI/MACD/ATR
+# 실시간(초 단위) 마지막 봉 보정(Binance 1m kline)
+# 타이밍 제안(BUY/SELL) · 손익 시뮬레이션 · 신호 로그 · 텔레그램 알림(선택)
 # 선형회귀 예측선(+ ATR 대역) · 보조지표 기본 펼침
 # ─────────────────────────────────────────────────────────
-import time, math, datetime as dt, requests
+import time, math, datetime as dt, threading, json, requests
 import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
+from websocket import WebSocketApp
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ================== 기본 설정 ==================
 st.set_page_config(page_title="SOL Live (Kraken)", page_icon="📈", layout="wide")
-
 INTERVAL_MIN = {"5m":5, "15m":15, "30m":30, "1h":60, "4h":240, "1d":1440}
 
 def _session():
     s = requests.Session()
-    s.headers.update({"User-Agent":"streamlit-sol-live/3.6"})
+    s.headers.update({"User-Agent":"streamlit-sol-live/4.0"})
     retry = Retry(total=3, backoff_factor=0.8,
                   status_forcelist=[429,500,502,503,504],
                   allowed_methods=["GET"])
@@ -95,6 +96,33 @@ def append_signal_log(signal, entry_px, stop_px, price, rsi_v, ma20, ma50, symbo
         "rsi":rsi_v, "ma20":ma20, "ma50":ma50
     }])], ignore_index=True)
 
+# -------- Binance WebSocket (1m kline) --------
+BINANCE_STREAM_TMPL = "wss://stream.binance.com:9443/ws/{}@kline_{}"
+
+def _ws_on_message(_, msg):
+    try:
+        data = json.loads(msg); k = data.get("k", {})
+        if not k: return
+        st.session_state.binance_live = {
+            "t": k["t"], "T": k["T"],  # start/end ms
+            "o": float(k["o"]), "h": float(k["h"]),
+            "l": float(k["l"]), "c": float(k["c"]),
+            "v": float(k["v"]), "x": bool(k["x"])  # x: closed?
+        }
+    except Exception as e:
+        st.session_state.ws_error = f"parse_error: {e}"
+
+def _ws_on_error(_, err): st.session_state.ws_error = str(err)
+def _ws_on_close(_a, _b, _c): st.session_state.ws_running = False
+
+def start_binance_ws(symbol="SOLUSDT", interval="1m"):
+    url = BINANCE_STREAM_TMPL.format(symbol.lower(), interval)
+    ws = WebSocketApp(url, on_message=_ws_on_message, on_error=_ws_on_error, on_close=_ws_on_close)
+    t = threading.Thread(target=ws.run_forever, kwargs={"ping_interval":20, "ping_timeout":10}, daemon=True)
+    t.start()
+    st.session_state.ws_running = True
+    st.session_state.ws_thread  = t
+
 # ================== 사이드바 ==================
 with st.sidebar:
     symbol   = st.selectbox("거래쌍 (Kraken)", ["SOLUSD","SOLUSDT"], index=0)
@@ -127,6 +155,11 @@ with st.sidebar:
     steps_ahead  = st.slider("예측 길이(봉)", 5, 60, 20, 5)
     band_k       = st.slider("불확실성 대역(ATR 배수)", 0.0, 2.0, 0.8, 0.1)
 
+    st.markdown("---")
+    st.subheader("실시간(초 단위) — Binance")
+    live_mode = st.toggle("WebSocket 실시간 켜기", value=False,
+                          help="SOLUSDT 1m kline으로 마지막 봉을 실시간 보정")
+
 st.title("📈 SOL 롱·숏 라이브 — Kraken")
 
 # ================== 데이터 로드/지표 ==================
@@ -137,12 +170,17 @@ except Exception as e:
     st.error(f"데이터 로드 오류: {e}")
     st.stop()
 
-df["MA20"]=df["close"].rolling(20).mean()
-df["MA50"]=df["close"].rolling(50).mean()
-m, s, h = macd(df["close"])
-df["MACD"], df["SIGNAL"], df["HIST"] = m, s, h
-df["RSI14"]=rsi(df["close"])
-df["ATR14"]=atr(df["high"], df["low"], df["close"], 14)
+def calc_indicators(d):
+    d = d.copy()
+    d["MA20"]=d["close"].rolling(20).mean()
+    d["MA50"]=d["close"].rolling(50).mean()
+    m, s, h = macd(d["close"])
+    d["MACD"], d["SIGNAL"], d["HIST"] = m, s, h
+    d["RSI14"]=rsi(d["close"])
+    d["ATR14"]=atr(d["high"], d["low"], d["close"], 14)
+    return d
+
+df = calc_indicators(df)
 
 price=float(df["close"].iloc[-1]); last=df.iloc[-1]
 atr14=float(last["ATR14"]) if not math.isnan(last["ATR14"]) else 0.0
@@ -176,24 +214,6 @@ long_stop_px   = round(price - 1.2*atr14, 2) if long_entry and atr14>0 else None
 short_entry_px = round(last["MA20"], 2) if short_entry else None
 short_stop_px  = round(price + 1.2*atr14, 2) if short_entry and atr14>0 else None
 
-# 신호 알림/로그
-new_signal = "BUY" if long_entry else ("SELL" if short_entry else None)
-if new_signal and new_signal != st.session_state.last_signal:
-    msg = (f"[{symbol}·{interval}] {new_signal} 신호\n"
-           f"가격: {price:.3f}\n"
-           f"진입: {long_entry_px or short_entry_px}\n"
-           f"손절: {long_stop_px or short_stop_px}\n"
-           f"RSI: {last['RSI14']:.1f}  MA20:{last['MA20']:.2f}  MA50:{last['MA50']:.2f}")
-    if enable_alerts and ((new_signal=="BUY" and notify_buy) or (new_signal=="SELL" and notify_sell)):
-        ok, detail = send_telegram(msg)
-        st.toast("텔레그램 전송 완료 ✅" if ok else f"텔레그램 실패: {detail}", icon="✅" if ok else "⚠️")
-    append_signal_log(new_signal,
-        (long_entry_px if new_signal=="BUY" else short_entry_px),
-        (long_stop_px  if new_signal=="BUY" else short_stop_px),
-        price, float(last["RSI14"]), float(last["MA20"]), float(last["MA50"]),
-        symbol, interval)
-    st.session_state.last_signal = new_signal
-
 # ================== KPI ==================
 k1,k2,k3,k4 = st.columns(4)
 k1.metric("현재가", f"{price:,.3f} USD")
@@ -216,6 +236,25 @@ if show_forecast and len(plot_df) > fit_len + 5:
     y_pred = a*fut_idx + b
     band = float(plot_df["ATR14"].iloc[-1]) * band_k if "ATR14" in plot_df and not np.isnan(plot_df["ATR14"].iloc[-1]) else 0.0
     forecast_df = pd.DataFrame({"time":fut_time, "pred":y_pred, "upper":y_pred+band, "lower":y_pred-band})
+
+# ================== Binance Live (옵션) ==================
+if live_mode:
+    if not st.session_state.get("ws_running"):
+        start_binance_ws(symbol="SOLUSDT", interval="1m")
+        st.toast("Binance WebSocket 연결 시도…", icon="⏱️")
+    live = st.session_state.get("binance_live")
+    if live:
+        # 마지막 봉 실시간 보정
+        plot_df.iloc[-1, plot_df.columns.get_loc("open")]  = live["o"]
+        plot_df.iloc[-1, plot_df.columns.get_loc("high")]  = max(plot_df.iloc[-1]["high"], live["h"])
+        plot_df.iloc[-1, plot_df.columns.get_loc("low")]   = min(plot_df.iloc[-1]["low"],  live["l"])
+        plot_df.iloc[-1, plot_df.columns.get_loc("close")] = live["c"]
+        # 간단 재계산
+        plot_df["MA20"]=plot_df["close"].rolling(20).mean()
+        plot_df["MA50"]=plot_df["close"].rolling(50).mean()
+        st.caption(f"🟢 Binance Live: {live['c']:.4f}  (1m, {'확정' if live['x'] else '진행중'})")
+else:
+    st.session_state.ws_running = False
 
 # ================== 메인 Plotly 캔들 ==================
 fig = go.Figure()
@@ -250,7 +289,7 @@ if not forecast_df.empty:
                                  fill="tonexty", fillcolor="rgba(31,119,180,0.12)", showlegend=False))
 # 자동 확대(Y padding)
 ymin = float(plot_df["low"].min()); ymax = float(plot_df["high"].max())
-ypad = (ymax - ymin) * (y_pad_pct/100); ypad = ypad if ypad>0 else max(price*0.01, 0.5)
+ypad = (ymax - ymin) * (y_pad_pct/100); ypad = ypad if ypad>0 else max(float(plot_df["close"].iloc[-1])*0.01, 0.5)
 fig.update_yaxes(range=[ymin-ypad, ymax+ypad])
 fig.update_layout(height=420, template="plotly_white",
                   xaxis_rangeslider_visible=False,
