@@ -1,8 +1,8 @@
 # ─────────────────────────────────────────────────────────
 # SOL Live — Kraken + 타이밍 엔진 + 텔레그램 알림 + 로그 저장
-# (화이트톤 UI, KPI 카드, 레벨 오버레이, 신호 요약, PnL, CSV 다운로드)
+# (화이트톤 UI, KPI 카드, 레벨 오버레이, 신호 요약, 안전한 PnL 시뮬레이션, CSV 다운로드)
 # ─────────────────────────────────────────────────────────
-import os, math, time, json, datetime as dt, requests
+import os, math, time, datetime as dt, requests
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -38,7 +38,7 @@ INTERVAL_MIN = {"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440}
 
 def _session():
     s = requests.Session()
-    s.headers.update({"User-Agent":"streamlit-sol-live/3.1"})
+    s.headers.update({"User-Agent":"streamlit-sol-live/3.2"})
     retry = Retry(total=3, backoff_factor=0.8,
                   status_forcelist=[429,500,502,503,504],
                   allowed_methods=["GET"])
@@ -242,8 +242,8 @@ ma20_line  = base.mark_line(strokeDash=[3,3]).encode(y='MA20:Q')
 ma50_line  = base.mark_line(strokeDash=[6,3]).encode(y='MA50:Q')
 
 levels = []
-if entry_long:   levels += [("Entry Long", long_entry_px), ("Stop Long", long_stop_px)]
-if entry_short:  levels += [("Entry Short", short_entry_px), ("Stop Short", short_stop_px)]
+if long_entry:   levels += [("Entry Long", long_entry_px), ("Stop Long", long_stop_px)]
+if short_entry:  levels += [("Entry Short", short_entry_px), ("Stop Short", short_stop_px)]
 for t in long_tgts:  levels.append((f"TP L {t}", t))
 for t in short_tgts: levels.append((f"TP S {t}", t))
 lvl_df = pd.DataFrame(levels, columns=["name","y"]) if levels else pd.DataFrame({"name":[],"y":[]})
@@ -288,30 +288,44 @@ with right:
     st.write(f"롱 {long_score}/3 · 숏 {short_score}/3")
 
     st.subheader("손익 시뮬레이션")
-    sim = pd.DataFrame(
-        # 사용자가 값을 비웠다면 현재가/ATR로 기본값 대입
-        (lambda el, sl, es, ss: (
-            [*(([["롱", t,
-                  ((t-el)/el)*lev*100,
-                  pos*(((t-el)/el)*lev)]] for t in [price+atr14*tp for tp in [1,1.5,2]]) if el==0 else
-               [["롱", t, ((t-el)/el)*lev*100, pos*(((t-el)/el)*lev)] for t in long_tgts])],
-            ["롱", sl or (price-atr14), (( (sl or (price-atr14)) - (el or price) )/(el or price))*lev*100, pos*((( (sl or (price-atr14)) - (el or price) )/(el or price))*lev)],
-            [*(([["숏", t,
-                  ((es-t)/es)*lev*100,
-                  pos*(((es-t)/es)*lev)]] for t in [price-atr14*tp for tp in [1,1.5,2]]) if es==0 else
-               [["숏", t, ((es-t)/es)*lev*100, pos*(((es-t)/es)*lev)] for t in short_tgts])],
-            ["숏", ss or (price+atr14), -abs((( (ss or (price+atr14)) - (es or price) )/(es or price))*lev*100), -abs(pos*((( (ss or (price+atr14)) - (es or price) )/(es or price))*lev))]
-        ))(entry_long, stop_long, entry_short, stop_short),
-        columns=["방향","목표가","예상 수익률(%)","예상 PnL(USDT)"]
-    )
+    sim_rows = []
+    # 롱 시뮬레이션 (사용자가 진입/손절 입력했을 때만)
+    if entry_long > 0:
+        for t in long_tgts:
+            ret = ((t - entry_long) / entry_long) * lev * 100
+            pnl = pos * (ret / 100)
+            sim_rows.append(["롱", t, ret, pnl])
+        if stop_long:
+            ret = ((stop_long - entry_long) / entry_long) * lev * 100
+            pnl = pos * (ret / 100)
+            sim_rows.append(["롱", stop_long, ret, pnl])
+    # 숏 시뮬레이션
+    if entry_short > 0:
+        for t in short_tgts:
+            ret = ((entry_short - t) / entry_short) * lev * 100
+            pnl = pos * (ret / 100)
+            sim_rows.append(["숏", t, ret, pnl])
+        if stop_short:
+            ret = -abs(((stop_short - entry_short) / entry_short) * lev * 100)
+            pnl = -abs(pos * (((stop_short - entry_short) / entry_short) * lev))
+            sim_rows.append(["숏", stop_short, ret, pnl])
+
+    sim = pd.DataFrame(sim_rows, columns=["방향","목표가","예상 수익률(%)","예상 PnL(USDT)"])
+
     def _color(v):
         if isinstance(v,(int,float)):
             if v>0: return "color:#065f46;font-weight:700"
             if v<0: return "color:#991b1b;font-weight:700"
         return ""
-    st.dataframe(sim.style.format({"예상 수익률(%)":"{:.2f}","예상 PnL(USDT)":"{:.2f}"})
-                 .applymap(_color, subset=["예상 수익률(%)","예상 PnL(USDT)"]),
-                 use_container_width=True, height=300)
+
+    if not sim.empty:
+        st.dataframe(
+            sim.style.format({"예상 수익률(%)":"{:.2f}","예상 PnL(USDT)":"{:.2f}"})
+               .applymap(_color, subset=["예상 수익률(%)","예상 PnL(USDT)"]),
+            use_container_width=True, height=300
+        )
+    else:
+        st.caption("포지션 정보가 없어 시뮬레이션을 표시할 수 없습니다.")
 
     st.subheader("타이밍 제안")
     if long_entry:
