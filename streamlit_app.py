@@ -4,6 +4,7 @@
 # 실시간(초 단위) 마지막 봉 보정(Binance 1m kline)
 # 타이밍 제안(BUY/SELL) · 손익 시뮬레이션 · 신호 로그 · 텔레그램 알림(선택)
 # 선형회귀 예측선(+ ATR 대역) · 보조지표 기본 펼침
+# Kraken/Binance 심볼을 사이드바에서 각각 선택(+직접 입력)
 # ─────────────────────────────────────────────────────────
 import time, math, datetime as dt, threading, json, requests
 import pandas as pd
@@ -14,13 +15,17 @@ from websocket import WebSocketApp
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ================== 기본 설정 ==================
 st.set_page_config(page_title="SOL Live (Kraken)", page_icon="📈", layout="wide")
+
+# 인기 심볼(원하면 자유롭게 수정)
+POPULAR_KRAKEN  = ["SOLUSD","SOLUSDT","ETHUSD","BTCUSD","XRPUSD","ADAUSD","DOGEUSD","ARBUSD","OPUSD"]
+POPULAR_BINANCE = ["SOLUSDT","ETHUSDT","BTCUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","ARBUSDT","OPUSDT"]
+
 INTERVAL_MIN = {"5m":5, "15m":15, "30m":30, "1h":60, "4h":240, "1d":1440}
 
 def _session():
     s = requests.Session()
-    s.headers.update({"User-Agent":"streamlit-sol-live/4.0"})
+    s.headers.update({"User-Agent":"streamlit-sol-live/4.1"})
     retry = Retry(total=3, backoff_factor=0.8,
                   status_forcelist=[429,500,502,503,504],
                   allowed_methods=["GET"])
@@ -56,7 +61,7 @@ def ticker_24h(symbol="SOLUSD"):
     change = (last-openp)/openp*100 if openp else 0.0
     return last, openp, change
 
-# -------- 지표 --------
+# ===== Indicators =====
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 def rsi(s, n=14):
     d=s.diff(); up=d.clip(lower=0); dn=-d.clip(upper=0)
@@ -69,7 +74,7 @@ def atr(high, low, close, n=14):
     tr = pd.concat([(high-low).abs(), (high-prev).abs(), (low-prev).abs()], axis=1).max(axis=1)
     return tr.rolling(n).mean()
 
-# -------- 텔레그램(선택) --------
+# ===== Telegram (optional) =====
 TG_TOKEN   = st.secrets.get("TELEGRAM_TOKEN", "")
 TG_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "")
 def send_telegram(text):
@@ -96,7 +101,7 @@ def append_signal_log(signal, entry_px, stop_px, price, rsi_v, ma20, ma50, symbo
         "rsi":rsi_v, "ma20":ma20, "ma50":ma50
     }])], ignore_index=True)
 
-# -------- Binance WebSocket (1m kline) --------
+# ===== Binance WebSocket (1m kline) =====
 BINANCE_STREAM_TMPL = "wss://stream.binance.com:9443/ws/{}@kline_{}"
 
 def _ws_on_message(_, msg):
@@ -104,10 +109,10 @@ def _ws_on_message(_, msg):
         data = json.loads(msg); k = data.get("k", {})
         if not k: return
         st.session_state.binance_live = {
-            "t": k["t"], "T": k["T"],  # start/end ms
+            "t": k["t"], "T": k["T"],
             "o": float(k["o"]), "h": float(k["h"]),
             "l": float(k["l"]), "c": float(k["c"]),
-            "v": float(k["v"]), "x": bool(k["x"])  # x: closed?
+            "v": float(k["v"]), "x": bool(k["x"])
         }
     except Exception as e:
         st.session_state.ws_error = f"parse_error: {e}"
@@ -123,9 +128,22 @@ def start_binance_ws(symbol="SOLUSDT", interval="1m"):
     st.session_state.ws_running = True
     st.session_state.ws_thread  = t
 
-# ================== 사이드바 ==================
+# ================= Sidebar =================
 with st.sidebar:
-    symbol   = st.selectbox("거래쌍 (Kraken)", ["SOLUSD","SOLUSDT"], index=0)
+    # ── 심볼 선택(기본값 유지: SOL) ──
+    kraken_symbol  = st.selectbox("거래쌍 (Kraken / OHLC)", POPULAR_KRAKEN, index=POPULAR_KRAKEN.index("SOLUSD"))
+    custom_k = st.text_input("직접 입력 (Kraken)", "", placeholder="예: ETHUSD")
+    if custom_k.strip():
+        kraken_symbol = custom_k.strip().upper()
+
+    binance_symbol = st.selectbox("실시간 (Binance WebSocket)", POPULAR_BINANCE, index=POPULAR_BINANCE.index("SOLUSDT"))
+    custom_b = st.text_input("직접 입력 (Binance)", "", placeholder="예: ETHUSDT")
+    if custom_b.strip():
+        binance_symbol = custom_b.strip().upper()
+
+    # 기존 코드 호환을 위해 매핑
+    symbol = kraken_symbol
+
     interval = st.selectbox("봉 간격", list(INTERVAL_MIN.keys()), index=1)
     refresh  = st.slider("자동 새로고침(초)", 0, 300, 60)
     st.caption("요청 과다 방지: 15초 이상 권장")
@@ -158,11 +176,11 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("실시간(초 단위) — Binance")
     live_mode = st.toggle("WebSocket 실시간 켜기", value=False,
-                          help="SOLUSDT 1m kline으로 마지막 봉을 실시간 보정")
+                          help="선택한 Binance 심볼(예: SOLUSDT) 1m kline으로 마지막 봉을 실시간 보정")
 
-st.title("📈 SOL 롱·숏 라이브 — Kraken")
+st.title("📈 Live — Kraken + Binance")
 
-# ================== 데이터 로드/지표 ==================
+# ================= Load & Indicators =================
 try:
     df = klines_kraken(symbol, interval, 500)
     last_px, open_px, chg24 = ticker_24h(symbol)
@@ -181,16 +199,15 @@ def calc_indicators(d):
     return d
 
 df = calc_indicators(df)
-
 price=float(df["close"].iloc[-1]); last=df.iloc[-1]
 atr14=float(last["ATR14"]) if not math.isnan(last["ATR14"]) else 0.0
 low24=float(df["low"].tail(96).min()); high24=float(df["high"].tail(96).max())
 
-# 목표가 가이드
+# Targets (ATR multiples)
 long_tgts  = [round(price + atr14*tp_factor*i, 2) for i in [1,1.5,2]]
 short_tgts = [round(price - atr14*tp_factor*i, 2) for i in [1,1.5,2]]
 
-# ================== 타이밍 엔진 ==================
+# ================= Timing Engine =================
 def score_long(row):
     s=0; s+=1 if row["MA20"]>row["MA50"] else 0
     s+=1 if row["MACD"]>row["SIGNAL"] else 0
@@ -214,21 +231,38 @@ long_stop_px   = round(price - 1.2*atr14, 2) if long_entry and atr14>0 else None
 short_entry_px = round(last["MA20"], 2) if short_entry else None
 short_stop_px  = round(price + 1.2*atr14, 2) if short_entry and atr14>0 else None
 
-# ================== KPI ==================
+# Alert & log
+new_signal = "BUY" if long_entry else ("SELL" if short_entry else None)
+if new_signal and new_signal != st.session_state.last_signal:
+    msg = (f"[{symbol}·{interval}] {new_signal} 신호\n"
+           f"가격: {price:.3f}\n"
+           f"진입: {long_entry_px or short_entry_px}\n"
+           f"손절: {long_stop_px or short_stop_px}\n"
+           f"RSI: {last['RSI14']:.1f}  MA20:{last['MA20']:.2f}  MA50:{last['MA50']:.2f}")
+    if enable_alerts and ((new_signal=="BUY" and notify_buy) or (new_signal=="SELL" and notify_sell)):
+        ok, detail = send_telegram(msg)
+        st.toast("텔레그램 전송 완료 ✅" if ok else f"텔레그램 실패: {detail}", icon="✅" if ok else "⚠️")
+    append_signal_log(new_signal,
+        (long_entry_px if new_signal=="BUY" else short_entry_px),
+        (long_stop_px  if new_signal=="BUY" else short_stop_px),
+        price, float(last["RSI14"]), float(last["MA20"]), float(last["MA50"]),
+        symbol, interval)
+    st.session_state.last_signal = new_signal
+
+# ================= KPIs =================
 k1,k2,k3,k4 = st.columns(4)
 k1.metric("현재가", f"{price:,.3f} USD")
 k2.metric("24h 변화", f"{((price-open_px)/open_px*100) if open_px else 0:+.2f}%")
 k3.metric("24h 고가", f"{high24:,.2f}")
 k4.metric("24h 저가", f"{low24:,.2f}")
 
-# ================== 예측(선형회귀 + ATR 대역) ==================
+# ================= Forecast (linear + ATR band) =================
 plot_df = df.tail(int(show_count)).copy()
 forecast_df = pd.DataFrame()
 if show_forecast and len(plot_df) > fit_len + 5:
     x = np.arange(len(plot_df)); y = plot_df["close"].to_numpy()
     x_fit = x[-fit_len:]; y_fit = y[-fit_len:]
-    a, b = np.polyfit(x_fit, y_fit, 1)   # y ≈ a*x + b
-
+    a, b = np.polyfit(x_fit, y_fit, 1)
     step_min = INTERVAL_MIN[interval]
     fut_idx = np.arange(x[-1]+1, x[-1]+1+steps_ahead)
     fut_time = pd.date_range(plot_df["time"].iloc[-1] + pd.Timedelta(minutes=step_min),
@@ -237,26 +271,25 @@ if show_forecast and len(plot_df) > fit_len + 5:
     band = float(plot_df["ATR14"].iloc[-1]) * band_k if "ATR14" in plot_df and not np.isnan(plot_df["ATR14"].iloc[-1]) else 0.0
     forecast_df = pd.DataFrame({"time":fut_time, "pred":y_pred, "upper":y_pred+band, "lower":y_pred-band})
 
-# ================== Binance Live (옵션) ==================
+# ================= Binance Live (optional) =================
 if live_mode:
     if not st.session_state.get("ws_running"):
-        start_binance_ws(symbol="SOLUSDT", interval="1m")
-        st.toast("Binance WebSocket 연결 시도…", icon="⏱️")
+        start_binance_ws(symbol=binance_symbol, interval="1m")
+        st.toast(f"Binance WebSocket 연결 시도… ({binance_symbol})", icon="⏱️")
     live = st.session_state.get("binance_live")
     if live:
-        # 마지막 봉 실시간 보정
+        # update last candle
         plot_df.iloc[-1, plot_df.columns.get_loc("open")]  = live["o"]
         plot_df.iloc[-1, plot_df.columns.get_loc("high")]  = max(plot_df.iloc[-1]["high"], live["h"])
         plot_df.iloc[-1, plot_df.columns.get_loc("low")]   = min(plot_df.iloc[-1]["low"],  live["l"])
         plot_df.iloc[-1, plot_df.columns.get_loc("close")] = live["c"]
-        # 간단 재계산
         plot_df["MA20"]=plot_df["close"].rolling(20).mean()
         plot_df["MA50"]=plot_df["close"].rolling(50).mean()
-        st.caption(f"🟢 Binance Live: {live['c']:.4f}  (1m, {'확정' if live['x'] else '진행중'})")
+        st.caption(f"🟢 Binance Live [{binance_symbol}]: {live['c']:.4f}  (1m, {'확정' if live['x'] else '진행중'})")
 else:
     st.session_state.ws_running = False
 
-# ================== 메인 Plotly 캔들 ==================
+# ================= Main Plotly chart =================
 fig = go.Figure()
 fig.add_candlestick(x=plot_df["time"], open=plot_df["open"], high=plot_df["high"],
                     low=plot_df["low"], close=plot_df["close"],
@@ -266,7 +299,7 @@ fig.add_trace(go.Scatter(x=plot_df["time"], y=plot_df["MA20"], mode="lines",
                          name="MA20", line=dict(width=1.4, dash="dot")))
 fig.add_trace(go.Scatter(x=plot_df["time"], y=plot_df["MA50"], mode="lines",
                          name="MA50", line=dict(width=1.4, dash="dash")))
-# 수평 레벨
+# levels
 levels = []
 if long_entry:   levels += [("Entry Long", long_entry_px), ("Stop Long", long_stop_px)]
 if short_entry:  levels += [("Entry Short", short_entry_px), ("Stop Short", short_stop_px)]
@@ -275,7 +308,7 @@ for t in short_tgts: levels.append((f"TP S {t}", t))
 for name, yv in [lv for lv in levels if lv[1] is not None]:
     fig.add_hline(y=yv, line_width=1, line_dash="dot",
                   annotation_text=name, annotation_position="top left")
-# 예측선/대역
+# forecast
 if not forecast_df.empty:
     fig.add_trace(go.Scatter(x=forecast_df["time"], y=forecast_df["pred"],
                              mode="lines", name="Forecast",
@@ -287,7 +320,7 @@ if not forecast_df.empty:
         fig.add_trace(go.Scatter(x=forecast_df["time"], y=forecast_df["upper"],
                                  mode="lines", line=dict(width=0.5, dash="dot", color="#1f77b4"),
                                  fill="tonexty", fillcolor="rgba(31,119,180,0.12)", showlegend=False))
-# 자동 확대(Y padding)
+# auto y padding
 ymin = float(plot_df["low"].min()); ymax = float(plot_df["high"].max())
 ypad = (ymax - ymin) * (y_pad_pct/100); ypad = ypad if ypad>0 else max(float(plot_df["close"].iloc[-1])*0.01, 0.5)
 fig.update_yaxes(range=[ymin-ypad, ymax+ypad])
@@ -300,7 +333,7 @@ left, right = st.columns([2,1], gap="large")
 with left:
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-    # 보조지표 (기본 펼침)
+    # Indicators (expanded by default)
     with st.expander("RSI / MACD / HIST", expanded=True):
         fr = go.Figure(go.Scatter(x=plot_df["time"], y=plot_df["RSI14"], mode="lines", name="RSI14"))
         fr.update_layout(height=140, template="plotly_white", margin=dict(l=0,r=0,t=0,b=0), yaxis_title="RSI14")
@@ -313,7 +346,7 @@ with left:
         fm.update_layout(height=160, template="plotly_white", margin=dict(l=0,r=0,t=0,b=0))
         st.plotly_chart(fm, use_container_width=True, config={"displayModeBar": False})
 
-# ================== Signals & PnL & Timing (오른쪽 컬럼) ==================
+# ================= Signals & PnL & Timing (right col) =================
 with right:
     st.subheader("신호 요약")
     lsc, ssc = score_long(last), score_short(last)
@@ -359,7 +392,7 @@ with right:
             st.session_state.signal_log.to_csv(index=False).encode("utf-8-sig"),
             file_name="signal_log.csv", mime="text/csv")
 
-# ================== 자동 새로고침 ==================
+# ================= Auto refresh =================
 if refresh and refresh>0:
     time.sleep(max(refresh, 15))
     st.rerun()
