@@ -1,6 +1,7 @@
 # ─────────────────────────────────────────────────────────
-# SOL Live — Kraken + 타이밍 엔진 + 텔레그램 알림 + 로그 저장
-# (화이트톤 UI, KPI 카드, 레벨 오버레이, 신호 요약, 안전한 PnL 시뮬레이션, CSV 다운로드)
+# SOL Live — Kraken
+# 타이밍 엔진 · 텔레그램 알림 · 신호 로그 CSV · 안전한 PnL 시뮬레이션
+# 캔들/라인 전환 · 선 굵기 · 표시 봉 수 · 선명한 라이트 차트
 # ─────────────────────────────────────────────────────────
 import os, math, time, datetime as dt, requests
 import pandas as pd
@@ -38,7 +39,7 @@ INTERVAL_MIN = {"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440}
 
 def _session():
     s = requests.Session()
-    s.headers.update({"User-Agent":"streamlit-sol-live/3.2"})
+    s.headers.update({"User-Agent":"streamlit-sol-live/3.3"})
     retry = Retry(total=3, backoff_factor=0.8,
                   status_forcelist=[429,500,502,503,504],
                   allowed_methods=["GET"])
@@ -140,6 +141,11 @@ with st.sidebar:
                               help="Settings ▸ Secrets에 TELEGRAM_TOKEN/TELEGRAM_CHAT_ID 저장 필요")
     notify_buy  = st.checkbox("BUY 신호 알림", value=True)
     notify_sell = st.checkbox("SELL 신호 알림", value=True)
+    st.markdown("---")
+    st.subheader("차트 보기")
+    chart_mode = st.radio("차트 모드", ["캔들", "라인"], index=0, horizontal=True)
+    stroke_w   = st.slider("선 굵기", 1.0, 4.0, 2.2, 0.1)
+    show_count = st.slider("표시 봉 수", 100, 500, 250, 50)
 
 # ================= Load & Calc =================
 st.subheader("데이터 소스: Kraken (캐시 3분)")
@@ -235,44 +241,78 @@ for title, val in kpis[4:8]:
     st.markdown(f'<div class="card"><h4>{title}</h4><div class="v">{val}</div></div>', unsafe_allow_html=True)
 st.markdown('</div>', unsafe_allow_html=True)
 
-# ================= Main Chart with Levels =================
-base = alt.Chart(df).encode(x='time:T')
-price_line = base.mark_line().encode(y='close:Q')
-ma20_line  = base.mark_line(strokeDash=[3,3]).encode(y='MA20:Q')
-ma50_line  = base.mark_line(strokeDash=[6,3]).encode(y='MA50:Q')
+# ================= Main Chart with Levels (선명하게) =================
+plot_df = df.tail(int(show_count)).copy()
 
+base = alt.Chart(plot_df).encode(x=alt.X('time:T', title='time'))
+ma20_line  = base.mark_line(strokeDash=[3,3], strokeWidth=1.2).encode(y='MA20:Q')
+ma50_line  = base.mark_line(strokeDash=[6,3], strokeWidth=1.2).encode(y='MA50:Q')
+
+if chart_mode == "라인":
+    price_layer = base.mark_line(strokeWidth=stroke_w).encode(y=alt.Y('close:Q', title=None))
+    area_layer  = base.mark_area(opacity=0.10).encode(y='close:Q')
+    price_block = alt.layer(area_layer, price_layer)
+else:
+    up_color   = alt.value("#0ea5e9")  # 파랑(양봉)
+    down_color = alt.value("#ef4444")  # 빨강(음봉)
+    rule = base.mark_rule().encode(
+        y='low:Q', y2='high:Q',
+        color=alt.condition('datum.open <= datum.close', up_color, down_color)
+    )
+    body = base.mark_bar(size=5).encode(
+        y='open:Q', y2='close:Q',
+        color=alt.condition('datum.open <= datum.close', up_color, down_color)
+    )
+    price_block = alt.layer(rule, body)
+
+# 수평 레벨
 levels = []
 if long_entry:   levels += [("Entry Long", long_entry_px), ("Stop Long", long_stop_px)]
 if short_entry:  levels += [("Entry Short", short_entry_px), ("Stop Short", short_stop_px)]
 for t in long_tgts:  levels.append((f"TP L {t}", t))
 for t in short_tgts: levels.append((f"TP S {t}", t))
 lvl_df = pd.DataFrame(levels, columns=["name","y"]) if levels else pd.DataFrame({"name":[],"y":[]})
-
 rule_layer  = alt.Chart(lvl_df).mark_rule().encode(y='y:Q', tooltip=['name:N','y:Q'])
 label_layer = alt.Chart(lvl_df).mark_text(align='left', dx=5, dy=-5).encode(y='y:Q', text='name:N')
 
-signals_df = pd.DataFrame({
+# BUY/SELL 마커
+sig_df = pd.DataFrame({
     "time":[df["time"].iloc[-1]]*2,
     "y":[long_entry_px if long_entry else np.nan, short_entry_px if short_entry else np.nan],
     "label":["BUY","SELL"]
 })
-point_layer = alt.Chart(signals_df.dropna()).mark_point(size=90).encode(x='time:T', y='y:Q', shape='label:N')
-text_layer  = alt.Chart(signals_df.dropna()).mark_text(dy=-10, fontWeight='bold').encode(x='time:T', y='y:Q', text='label:N')
+point_layer = alt.Chart(sig_df.dropna()).mark_point(size=95).encode(x='time:T', y='y:Q', shape='label:N')
+text_layer  = alt.Chart(sig_df.dropna()).mark_text(dy=-10, fontWeight='bold').encode(x='time:T', y='y:Q', text='label:N')
 
-main_chart = alt.layer(price_line, ma20_line, ma50_line, rule_layer, label_layer, point_layer, text_layer)\
-    .properties(height=320, title=f"{symbol} · {interval}")\
+main_chart = alt.layer(price_block, ma20_line, ma50_line, rule_layer, label_layer, point_layer, text_layer)\
+    .properties(height=380, background='white', title=f"{symbol} · {interval}")\
+    .configure_axis(grid=True, gridOpacity=0.25, tickSize=3, labelColor='#111', titleColor='#111')\
     .interactive()
 
 left, right = st.columns([2,1], gap="large")
 with left:
     st.altair_chart(main_chart, use_container_width=True)
     with st.expander("RSI / MACD / HIST", expanded=False):
-        st.altair_chart(alt.Chart(df).mark_line().encode(x='time:T', y='RSI14:Q').properties(height=140), use_container_width=True)
-        st.altair_chart(alt.layer(
-            alt.Chart(df).mark_line().encode(x='time:T', y='MACD:Q'),
-            alt.Chart(df).mark_line().encode(x='time:T', y='SIGNAL:Q')
-        ).properties(height=140), use_container_width=True)
-        st.altair_chart(alt.Chart(df).mark_bar().encode(x='time:T', y='HIST:Q').properties(height=120), use_container_width=True)
+        st.altair_chart(
+            alt.Chart(plot_df).mark_line(strokeWidth=1.6).encode(x='time:T', y='RSI14:Q')
+              .properties(height=150, background='white')
+              .configure_axis(grid=True, gridOpacity=0.25),
+            use_container_width=True
+        )
+        st.altair_chart(
+            alt.layer(
+                alt.Chart(plot_df).mark_line(strokeWidth=1.8).encode(x='time:T', y='MACD:Q'),
+                alt.Chart(plot_df).mark_line(strokeWidth=1.2).encode(x='time:T', y='SIGNAL:Q')
+            ).properties(height=150, background='white')
+             .configure_axis(grid=True, gridOpacity=0.25),
+            use_container_width=True
+        )
+        st.altair_chart(
+            alt.Chart(plot_df).mark_bar().encode(x='time:T', y='HIST:Q')
+              .properties(height=120, background='white')
+              .configure_axis(grid=True, gridOpacity=0.25),
+            use_container_width=True
+        )
 
 # ================= Signals & PnL & Timing =================
 with right:
@@ -289,7 +329,6 @@ with right:
 
     st.subheader("손익 시뮬레이션")
     sim_rows = []
-    # 롱 시뮬레이션 (사용자가 진입/손절 입력했을 때만)
     if entry_long > 0:
         for t in long_tgts:
             ret = ((t - entry_long) / entry_long) * lev * 100
@@ -299,7 +338,6 @@ with right:
             ret = ((stop_long - entry_long) / entry_long) * lev * 100
             pnl = pos * (ret / 100)
             sim_rows.append(["롱", stop_long, ret, pnl])
-    # 숏 시뮬레이션
     if entry_short > 0:
         for t in short_tgts:
             ret = ((entry_short - t) / entry_short) * lev * 100
@@ -348,7 +386,7 @@ with right:
     else:
         st.caption("아직 기록된 신호가 없습니다.")
 
-# ================= Auto refresh =================
-if refresh and refresh>0:
+# ================= Auto refresh (신버전) =================
+if refresh and refresh > 0:
     time.sleep(max(refresh, 15))
-    st.experimental_rerun()
+    st.rerun()
