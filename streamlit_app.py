@@ -1,60 +1,56 @@
 # ─────────────────────────────────────────────────────────
-# SOL Live — CoinGecko 전용 (429 방지: 캐시 + 재시도 + 요청 제한)
+# SOL Live — Kraken 공개 API (빠름, 키 불필요)
 # 파일: streamlit_app.py
 # ─────────────────────────────────────────────────────────
-import math, time, requests
+import time, math, requests
 import pandas as pd
 import numpy as np
 import streamlit as st
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ================== 기본 설정 ==================
-st.set_page_config(page_title="SOL Live (CoinGecko)", page_icon="📈", layout="wide")
-st.title("📈 SOL 롱·숏 라이브 — CoinGecko")
+st.set_page_config(page_title="SOL Live (Kraken)", page_icon="📈", layout="wide")
+st.title("📈 SOL 롱·숏 라이브 — Kraken")
 
-# 봉 간격 매핑
-RULE   = {"5m":"5T","15m":"15T","30m":"30T","1h":"1H","4h":"4H","1d":"1D"}
-MINUTE = {"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440}
+# ── 공용 설정
+INTERVAL_MIN = {"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440}
 
-# ================== 데이터 소스 (CoinGecko) ==================
 def _session():
     s = requests.Session()
     s.headers.update({"User-Agent":"streamlit-sol-live/1.0"})
-    retry = Retry(
-        total=3, backoff_factor=1.2,
-        status_forcelist=[429,500,502,503,504],
-        allowed_methods=["GET"]
-    )
+    retry = Retry(total=3, backoff_factor=0.8,
+                  status_forcelist=[429,500,502,503,504],
+                  allowed_methods=["GET"])
     s.mount("https://", HTTPAdapter(max_retries=retry))
     return s
 
-@st.cache_data(ttl=180, show_spinner=False)  # 3분 캐시
-def klines_gecko(symbol="SOL", interval="15m", limit=500):
-    coin_id = {"SOL":"solana","SOLUSDT":"solana","SOLUSD":"solana"}.get(symbol.upper())
-    if not coin_id:
-        raise ValueError("현재는 SOL/SOLUSDT만 지원합니다.")
-
-    # 과요청 방지: 최대 6일만 요청
-    need_min = min(limit * MINUTE[interval], 60*24*6)
-    days = max(1, int(math.ceil(need_min/(60*24))))
-
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    r = _session().get(url, params={"vs_currency":"usd","days":days,"interval":"minute"}, timeout=12)
+@st.cache_data(ttl=180, show_spinner=False)
+def klines_kraken(symbol="SOLUSD", interval="15m", limit=500):
+    """Kraken OHLC → DataFrame
+       반환 컬럼: time, close, high, low, volume
+    """
+    kr_interval = INTERVAL_MIN[interval]          # Kraken은 분 단위 정수
+    pair = symbol.upper()                          # 예: SOLUSD, SOLUSDT
+    url = "https://api.kraken.com/0/public/OHLC"
+    r = _session().get(url, params={"pair": pair, "interval": kr_interval}, timeout=10)
     r.raise_for_status()
-
-    prices = r.json().get("prices", [])  # [[ms, price], ...]
-    if not prices: raise RuntimeError("CoinGecko: 데이터 없음")
-
-    df = pd.DataFrame(prices, columns=["ms","close"])
-    df["time"] = pd.to_datetime(df["ms"], unit="ms")
-    df = (df.set_index("time").resample(RULE[interval]).last().dropna().reset_index())
-    df["high"]   = df["close"]
-    df["low"]    = df["close"]
-    df["volume"] = np.nan
+    js = r.json()
+    if js.get("error"):
+        raise RuntimeError(js["error"])
+    # 결과 키는 종종 변형됨(예: "SOLUSD" 또는 "SOLUSD.d")
+    key = [k for k in js["result"].keys() if k != "last"][0]
+    rows = js["result"][key]
+    if not rows:
+        raise RuntimeError("Kraken: 데이터 없음")
+    # [time, open, high, low, close, vwap, volume, count]
+    df = pd.DataFrame(rows, columns=["ts","open","high","low","close","vwap","volume","count"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="s")
+    for c in ["open","high","low","close","vwap","volume"]:
+        df[c] = df[c].astype(float)
+    df = df.tail(limit).rename(columns={"ts":"time"})  # 최신 limit개 사용
     return df[["time","close","high","low","volume"]]
 
-# ================== 보조 지표 ==================
+# ── 보조 지표
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 def rsi(s, n=14):
     d=s.diff(); up=d.clip(lower=0); dn=-d.clip(upper=0)
@@ -77,16 +73,13 @@ def pnl_rows_short(entry, stop, tgts, lev, pos):
     loss=((stop-entry)/entry)*lev*100; rows.append(["숏", stop, -abs(loss), -abs(pos*(loss/100))])
     return rows
 
-# ================== 사이드바 ==================
+# ── 사이드바 (모바일 최적)
 with st.sidebar:
-    symbol   = st.text_input("심볼", "SOL").upper()
-    interval = st.selectbox("봉 간격", list(RULE.keys()), index=1)
-
-    # 429 방지: 30초 이상 권장, 기본 60초
+    symbol   = st.selectbox("심볼 (Kraken)", ["SOLUSD","SOLUSDT"], index=0)
+    interval = st.selectbox("봉 간격", list(INTERVAL_MIN.keys()), index=1)
     refresh  = st.slider("자동 새로고침(초)", 0, 300, 60)
-    if refresh and refresh < 30:
-        st.info("429 방지를 위해 자동 새로고침은 30초 이상을 권장합니다.")
-
+    if refresh and refresh < 15:
+        st.info("요청 과다 방지를 위해 15초 이상을 권장합니다.")
     st.markdown("---")
     st.subheader("전략 파라미터")
     entry_long  = st.number_input("롱 진입가", 183.0, step=0.1)
@@ -98,32 +91,28 @@ with st.sidebar:
     targets_long  = [190,200,210]
     targets_short = [175,170,165]
 
-# ================== 렌더 ==================
+# ── 렌더
 def render_once():
     try:
-        df = klines_gecko(symbol, interval, 500)
-        st.caption("데이터 소스: CoinGecko (종가 기반, 캐시 3분)")
+        df = klines_kraken(symbol, interval, 500)
+        st.caption("데이터 소스: Kraken (캐시 3분)")
     except Exception as e:
         st.error(f"데이터 로드 오류: {e}")
         st.stop()
 
-    # 지표
     df["MA20"]=df["close"].rolling(20).mean()
     df["MA50"]=df["close"].rolling(50).mean()
     mac, sig, hist = macd(df["close"])
     df["MACD"], df["SIGNAL"], df["HIST"] = mac, sig, hist
     df["RSI14"]=rsi(df["close"])
-
     price=float(df["close"].iloc[-1]); last=df.iloc[-1]
 
-    # KPI
     c1,c2,c3,c4 = st.columns(4)
-    c1.metric("현재가", f"{price:,.3f} USDT")
+    c1.metric("현재가", f"{price:,.3f} USD")
     c2.metric("RSI(14)", f"{last['RSI14']:.1f}")
     c3.metric("MA20", f"{last['MA20']:.2f}")
     c4.metric("MA50", f"{last['MA50']:.2f}")
 
-    # 차트/표
     left,right = st.columns([2,1])
     with left:
         st.subheader(f"{symbol} · {interval}")
@@ -152,9 +141,6 @@ def render_once():
 
 render_once()
 
-# 자동 새로고침 루프 (30초 이상 권장)
-if refresh and refresh > 0:
-    effective = max(refresh, 30)
-    while True:
-        time.sleep(effective)
-        st.experimental_rerun()
+if refresh and refresh>0:
+    time.sleep(max(refresh, 15))
+    st.experimental_rerun()
